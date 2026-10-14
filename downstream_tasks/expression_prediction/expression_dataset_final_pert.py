@@ -464,11 +464,13 @@ class ExpressionDataset(Dataset):
                         length = end_i
                 else:
                     length = end_i - start_i  
-                token = self.gen_tokenizer.decode([token_id])  
-                token_lengths.append((token_id, token, length))
+                # Only token ids and genomic offsets are persisted in the HDF5
+                # cache. Decoding every token here is unused and makes the
+                # first cache build needlessly expensive.
+                token_lengths.append((token_id, length))
     
         if reverse == 0:
-            start_gene = start - sum(t[2] for t in token_lengths)
+            start_gene = start - sum(t[1] for t in token_lengths)
         else:
             start_gene = end
     
@@ -497,12 +499,11 @@ class ExpressionDataset(Dataset):
                     length = end_i
             else:
                 length = end_i - start_i 
-            token = self.gen_tokenizer.decode([token_id])  
-            token_lengths.append((token_id, token, length))
+            token_lengths.append((token_id, length))
             
         if reverse == 1: 
             token_lengths.reverse()
-        token_lengths_df = pd.DataFrame(token_lengths, columns=['token_id', 'token', 'length'])
+        token_lengths_df = pd.DataFrame(token_lengths, columns=['token_id', 'length'])
         token_lengths_df['start'] = token_lengths_df['length'].cumsum().shift(fill_value=0) + start_gene 
         token_lengths_df['end'] = token_lengths_df['start'] + token_lengths_df['length']
         token_lengths_df['chrom'] = chrom

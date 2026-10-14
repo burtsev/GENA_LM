@@ -1,4 +1,4 @@
-TASK_NAME: expression/final_tf-borzoi-all_genes
+TASK_NAME: expression/final_tf-4cls-adapter-borzoi-all_genes
 
 HOME_PATH: ${oc.env:GENALM_HOME}
 
@@ -8,7 +8,7 @@ MODEL_PATH_ROOT: ${HOME_PATH}/runs/${TASK_NAME}
 args_params:
 
   _target_: builtins.dict
-  init_checkpoint: "${HOME_PATH}/models/all_datasets_2/pytorch_model.bin"
+  init_checkpoint: "${oc.env:PERT_DATA_ROOT}/models/all_datasets_2/pytorch_model.bin"
   resume:
 
   model_cfg: "./data/configs/L12-H768-A12-V32k-preln.json"
@@ -31,11 +31,12 @@ args_params:
 
   log_interval: 50
 
-  valid_interval: 50
+  # A complete 35,086-item validation pass takes about 24 minutes on one H100.
+  valid_interval: 10000
 
   save_best: True
 
-  save_interval: 2500
+  save_interval: 10000
 
   optimize_metric: "pearson_corr_cells_all_borzoi_human"
 
@@ -57,24 +58,31 @@ args_params:
 
   iters: 350000
 
-  gen_tokenizer: "AIRI-Institute/gena-lm-bert-base-t2t"
+  gen_tokenizer: "${oc.env:PERT_DATA_ROOT}/models/modernbert_large"
 
-  # tokenizer of the tf panel encoder (lies in the same folder as the tf model)
-  tf_tokenizer: "${HOME_PATH}/models/moderngena-tf-bins50"
+  # The four-CLS checkpoint bundle copies the legacy-compatible 57-token tokenizer.
+  tf_tokenizer: "${oc.env:PERT_DATA_ROOT}/models/moderngena-tf-4cls"
 
-selected_targets_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/datasets/data/marker_genes.txt"
+selected_targets_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/datasets/data/ct_specific_benchmark/selected_targets.csv"
 
 model_kwargs:
   _target_: builtins.dict
   hf: True
-  hf_model_name: "AIRI-Institute/moderngena-large"
-  hf_model_name_decoder: "${HOME_PATH}/models/decoder" #dp0.1"
-  tf_model_path: "${HOME_PATH}/models/moderngena-tf-bins50"
+  hf_model_name: "${oc.env:PERT_DATA_ROOT}/models/modernbert_large"
+  hf_model_name_decoder: "${oc.env:PERT_DATA_ROOT}/models/decoder" #dp0.1"
+  # The legacy 1,024-wide checkpoint is incompatible. Null means deliberate scratch init.
+  # Replace with a matching four-CLS checkpoint directory after expression pretraining.
+  tf_model_path: null
+  tf_config_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/configs/expression_profile_encoder_4cls"
+  # Mixed precision remains BF16; this separately records the stored parameter dtype.
+  tf_parameter_dtype: "float32"
+  # Freeze the DNA encoder, decoder, LayerNorms, and prediction head.
+  expression_encoder_only: true
   # DNA encoder freezing:
   #   null  - the whole encoder is trainable
   #   0     - every layer frozen
   #   k     - only the last k layers (+ final norm) are trainable
-  bert_trainable_layers: 2
+  bert_trainable_layers: 0
   # train the token embeddings of the DNA encoder (ignored when bert_trainable_layers is null)
   bert_train_embeddings: false
 
@@ -96,8 +104,14 @@ shared_dataset_params:
   gen_tokenizer: ${args_params.gen_tokenizer}
   gen_max_seq_len: ${args_params.input_seq_len}
   tf_tokenizer: ${args_params.tf_tokenizer}
+  # Canonical checkpoint-side encoding artifacts; all splits must use these exact files.
+  panel_genes_path: "${oc.env:PERT_DATA_ROOT}/models/moderngena-tf-4cls/panel_genes.txt"
+  bin_edges_path: "${oc.env:PERT_DATA_ROOT}/models/moderngena-tf-4cls/bin_edges.npy"
+  encoding_metadata_path: "${oc.env:PERT_DATA_ROOT}/models/moderngena-tf-4cls/expression_encoding.json"
   # one gene id per line: these genes are always [UNK] in the tf panel and are never targets
-  unk_genes_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/datasets/data/marker_genes.txt"
+  # The historical marker_genes.txt is absent from this checkout. Keep the
+  # forced-unknown list explicitly empty; absent/non-finite profile values still use [UNK].
+  unk_genes_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/intervals/tf_unk_genes.txt"
   loglevel:
     "_target_": "logging.getLevelName"
     "level": "DEBUG"
@@ -108,8 +122,8 @@ train_dataset_human:
   _target_: downstream_tasks.expression_prediction.expression_dataset_final_tf.ExpressionDataset
   forward_intervals_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/intervals/human.forward.csv"
   reverse_intervals_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/intervals/human.reverse.csv"
-  targets_path: "${HOME_PATH}/data/expr_dataset/splits/train_file_mappings.csv"
-  genome: "${HOME_PATH}/genomes/GRCh38.primary_assembly.genome.fa"
+  targets_path: "${oc.env:PERT_DATA_ROOT}/data/pert/train_file_mappings_tpm_borzoi_v1_qref.csv"
+  genome: "${oc.env:PERT_GENOME}"
   tpm: csv
   num_before: 512
   transform_targets_tpm:
@@ -121,23 +135,13 @@ valid_dataset_human:
   _target_: downstream_tasks.expression_prediction.expression_dataset_final_tf.ExpressionDataset
   forward_intervals_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/intervals/human.forward.csv"
   reverse_intervals_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/intervals/human.reverse.csv"
-  targets_path: "${HOME_PATH}/data/expr_dataset/splits/valid_file_mappings.csv"
-  genome: "${HOME_PATH}/genomes/GRCh38.primary_assembly.genome.fa"
+  targets_path: "${oc.env:PERT_DATA_ROOT}/data/pert/valid_file_mappings_tpm_borzoi_v1_qref.csv"
+  genome: "${oc.env:PERT_GENOME}"
   tpm: csv
   num_before: 512
   transform_targets_tpm:
     _target_: downstream_tasks.expression_prediction.expression_dataset_final_tf.logtransform
     pseudocount: 1
 
-#test: evaluated every time valid is evaluated
-test_dataset_human:
-  _target_: downstream_tasks.expression_prediction.expression_dataset_final_tf.ExpressionDataset
-  forward_intervals_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/intervals/human.forward.csv"
-  reverse_intervals_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/intervals/human.reverse.csv"
-  targets_path: "${HOME_PATH}/data/expr_dataset/splits/test_file_mappings.csv"
-  genome: "${HOME_PATH}/genomes/GRCh38.primary_assembly.genome.fa"
-  tpm: csv
-  num_before: 512
-  transform_targets_tpm:
-    _target_: downstream_tasks.expression_prediction.expression_dataset_final_tf.logtransform
-    pseudocount: 1
+# The existing archive has no independent test mapping. Validation remains separate;
+# do not silently reuse it as test data.

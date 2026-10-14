@@ -1,10 +1,15 @@
 # stdlib
 import json
+import contextlib
+import hashlib
 import logging
+import math
 import os
+import shutil
 import time
+from collections import defaultdict
 from functools import partial
-from itertools import chain, compress
+from itertools import chain, compress, islice
 from pathlib import Path
 
 # third-party
@@ -35,6 +40,11 @@ import lm_experiments_tools.optimizers as optimizers
 from lm_experiments_tools import get_optimizer
 
 from downstream_tasks.expression_prediction.expression_dataset_final import worker_init_fn
+from downstream_tasks.expression_prediction.expression_profile_encoder import (
+    EXPRESSION_CLS_COUNT,
+    EXPRESSION_CLS_TOKEN_ID,
+    cls_positions,
+)
 from downstream_tasks.expression_prediction.datasets.src.score_ct_specificity import score_predictions, mean_and_residuals_correlation
 from downstream_tasks.expression_prediction.datasets.src.correlation_selected_cells import calculate_target_genes_metrics
 
@@ -110,6 +120,96 @@ class TrainerWithTest(Trainer):
         super().__init__(*args, **kwargs)
         self.test_dataloader = test_dataloader
         self.test_metrics_fn = test_metrics_fn
+
+    def step(self, batch, is_train_mode=True):
+        """Process physical batches sequentially and synchronize once per optimizer update.
+
+        The upstream trainer expects one materialized effective batch and slices it after
+        moving every tensor to the GPU.  Training receives a tuple of physical DataLoader
+        batches instead, so only one microbatch is transferred/resident at a time.
+        """
+        microbatches = list(batch) if isinstance(batch, (tuple, list)) else [batch]
+        if len(microbatches) == 0:
+            raise ValueError("An optimizer update needs at least one physical batch")
+
+        if is_train_mode:
+            self.model.train()
+            self.optimizer.zero_grad()
+        else:
+            self.model.eval()
+
+        metric_tensors = defaultdict(lambda: 0.0)
+        metrics_data = defaultdict(list)
+        n_microbatches = len(microbatches)
+
+        with torch.set_grad_enabled(is_train_mode):
+            for microbatch_index, microbatch in enumerate(microbatches):
+                if self.batch_transform_fn:
+                    microbatch = self.batch_transform_fn(microbatch)
+
+                forward_batch = {}
+                batch_sizes = []
+                for key, value in microbatch.items():
+                    if key in self.model_forward_args and isinstance(value, torch.Tensor):
+                        value = value.to(self.device, non_blocking=True)
+                        microbatch[key] = value
+                        forward_batch[key] = value
+                        batch_sizes.append(value.size(0))
+                if not batch_sizes or any(size != batch_sizes[0] for size in batch_sizes):
+                    raise RuntimeError(f"not all model inputs share a batch dimension: {batch_sizes}")
+
+                is_last = microbatch_index == n_microbatches - 1
+                sync_context = contextlib.nullcontext if (not is_train_mode or is_last) else self.accelerator.no_sync
+                with sync_context(self.model):
+                    outputs = self.model(**forward_batch, **self.forward_kwargs)
+                    loss = outputs["loss"]
+
+                    metrics = self.batch_metrics_fn(microbatch, outputs)
+                    for key, value in metrics.items():
+                        if isinstance(value, torch.Tensor):
+                            metric_tensors[key] = metric_tensors[key] + value.detach() / n_microbatches
+                        else:
+                            metric_tensors[key] = metric_tensors[key] + value / n_microbatches
+
+                    # Full predictions are required for validation metrics, but copying
+                    # them every training microbatch serializes the GPU and is unnecessary.
+                    if not is_train_mode and self.keep_for_metrics_fn and self.metrics_fn:
+                        for key, value in self.keep_for_metrics_fn(microbatch, outputs).items():
+                            metrics_data[key].append(value.detach().cpu() if isinstance(value, torch.Tensor) else value)
+
+                    if is_train_mode:
+                        # Accelerator divides by configured accumulation steps. Rescale a
+                        # short final group so its gradients remain a true microbatch mean.
+                        scale = self.args.gradient_accumulation_steps / n_microbatches
+                        self.accelerator.backward(loss * scale)
+
+        if is_train_mode:
+            if self.clip_grad:
+                global_grad_norm = self._clip_gradients()
+            else:
+                global_grad_norm = self._get_gradients_global_norm()
+            self.global_grad_norms.append(global_grad_norm)
+            self.optimizer.step()
+            if self.lr_scheduler:
+                self.lr_scheduler.step()
+
+        # One scalar synchronization per reported metric and optimizer/eval step, not
+        # one synchronization for every microbatch and every conditional loss branch.
+        batch_metrics = {
+            key: value.item() if isinstance(value, torch.Tensor) else value
+            for key, value in metric_tensors.items()
+        }
+        return batch_metrics, metrics_data
+
+    def collect_metrics(self, split: str):
+        if split != "train":
+            return super().collect_metrics(split)
+        keep_for_metrics_fn = self.keep_for_metrics_fn
+        try:
+            self.keep_for_metrics_fn = None
+            return super().collect_metrics(split)
+        finally:
+            self.keep_for_metrics_fn = keep_for_metrics_fn
 
     def validate(self, dataloader, split='valid', write_tb=True):
         metrics = super().validate(dataloader, split=split, write_tb=write_tb)
@@ -203,6 +303,32 @@ def build_dataset_from_cfgs(dataset_cfgs: List[Any]) -> Tuple[Dataset, List[Data
     return ConcatDataset(datasets), datasets
 
 
+def validate_expression_encoding_consistency(datasets: List[Dataset]) -> str:
+    """Require every training/evaluation dataset to use one checkpoint encoding."""
+    missing = [type(dataset).__name__ for dataset in datasets if not hasattr(dataset, "expression_encoding_signature")]
+    if missing:
+        raise ValueError(f"Datasets do not expose expression encoding metadata: {missing}")
+    signatures = {dataset.expression_encoding_signature for dataset in datasets}
+    if len(signatures) != 1:
+        raise ValueError(
+            "Training, validation, and test datasets use inconsistent expression gene order, bins, "
+            f"tokenizer, CLS placement, or attention schedule: {sorted(signatures)}"
+        )
+    return signatures.pop()
+
+
+def persist_expression_encoding_artifacts(shared_params, model_path: Path, tf_tokenizer: str) -> None:
+    """Keep the canonical encoding definition next to downstream checkpoints."""
+    destination = model_path / "expression_encoding"
+    destination.mkdir(parents=True, exist_ok=True)
+    for key in ("panel_genes_path", "bin_edges_path", "encoding_metadata_path"):
+        source = Path(str(shared_params[key])).expanduser()
+        if not source.is_file():
+            raise FileNotFoundError(f"Required expression encoding artifact is missing: {source}")
+        shutil.copy2(source, destination / source.name)
+    AutoTokenizer.from_pretrained(tf_tokenizer).save_pretrained(destination)
+
+
 def build_loader(
     dataset: Dataset,
     accelerator,
@@ -233,6 +359,72 @@ def build_loader(
         worker_init_fn=worker_init_fn,
     )
     return loader, sampler
+
+
+class GradientAccumulationLoader:
+    """Group physical DataLoader iterations into one optimizer-update unit."""
+
+    def __init__(self, loader: DataLoader, accumulation_steps: int):
+        if accumulation_steps <= 0:
+            raise ValueError(f"accumulation_steps must be positive, got {accumulation_steps}")
+        self.loader = loader
+        self.accumulation_steps = accumulation_steps
+        self.dataset = loader.dataset
+        self.sampler = loader.sampler
+
+    def __iter__(self):
+        iterator = iter(self.loader)
+        while True:
+            group = tuple(islice(iterator, self.accumulation_steps))
+            if not group:
+                return
+            yield group
+
+    def __len__(self):
+        return math.ceil(len(self.loader) / self.accumulation_steps)
+
+
+def build_expression_panel_bank(datasets: List[Dataset]) -> torch.Tensor:
+    """Deduplicate dataset panels and configure compact per-sample bank indices.
+
+    The returned uint8 tensor is registered as a non-persistent model buffer.  With
+    the 57-token vocabulary, all existing profiles fit in about 20 MiB on the GPU.
+    """
+    panels = []
+    digest_to_indices = defaultdict(list)
+
+    def add_panel(panel: torch.Tensor) -> int:
+        panel = panel.detach().to(dtype=torch.uint8, device="cpu").contiguous()
+        if panel.ndim != 1:
+            raise ValueError(f"Expression panels must be rank one, got {tuple(panel.shape)}")
+        expected_positions = cls_positions(panel.numel() - 1 - EXPRESSION_CLS_COUNT)
+        observed_cls = panel.eq(EXPRESSION_CLS_TOKEN_ID).nonzero(as_tuple=False).flatten().tolist()
+        if observed_cls != list(expected_positions):
+            raise ValueError(
+                f"Panel CLS positions {observed_cls} do not match canonical positions {expected_positions}"
+            )
+        digest = hashlib.sha256(panel.numpy().tobytes()).digest()
+        for index in digest_to_indices[digest]:
+            if torch.equal(panels[index], panel):
+                return index
+        index = len(panels)
+        panels.append(panel)
+        digest_to_indices[digest].append(index)
+        return index
+
+    for dataset in datasets:
+        key_to_index = {
+            key: add_panel(panel) for key, panel in dataset.expression_panel_entries()
+        }
+        unknown_index = add_panel(dataset.tf_unknown_panel)
+        dataset.configure_expression_panel_indices(key_to_index, unknown_index)
+
+    if not panels:
+        raise ValueError("Cannot build an expression panel bank from an empty dataset list")
+    lengths = {panel.numel() for panel in panels}
+    if len(lengths) != 1:
+        raise ValueError(f"Expression panels have inconsistent lengths: {sorted(lengths)}")
+    return torch.stack(panels)
 
 def main():
     args = parser.parse_args()
@@ -338,7 +530,15 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.gen_tokenizer, trust_remote_code=True)
     if getattr(args, "tf_tokenizer", None) is None:
         raise ValueError("args_params.tf_tokenizer must be set in the experiment config")
-    tf_pad_id = AutoTokenizer.from_pretrained(args.tf_tokenizer).pad_token_id
+
+    if accelerator.is_main_process:
+        shared_for_artifacts = OmegaConf.to_container(
+            experiment_config.get("shared_dataset_params", {}), resolve=True
+        )
+        persist_expression_encoding_artifacts(
+            shared_for_artifacts, Path(args.model_path), args.tf_tokenizer
+        )
+    accelerator.wait_for_everyone()
 
     def _pad_1d(x: torch.Tensor, length: int, pad_value: int, pad_left: bool = False) -> torch.Tensor:
         pad_len = length - x.size(0)
@@ -384,11 +584,6 @@ def main():
 
         batch_dict = {key: [] for key in pad_keys + no_pad_keys + special_keys}
 
-        # tf panels: (n_keys, T) each; padded along T in case panels of different length appear
-        max_tf_len = max(sample['tf_ids'].size(1) for sample in batch)
-        tf_ids_batch = [_pad_2d(sample['tf_ids'], max_tf_len, tf_pad_id, dim=1) for sample in batch]
-        tf_mask_batch = [_pad_2d(sample['tf_attention_mask'], max_tf_len, 0, dim=1) for sample in batch]
-
         for sample in batch:
             for key in pad_keys:
                 x = sample[key]
@@ -414,14 +609,17 @@ def main():
             if len(batch_dict[key]) > 0:
                 batch_dict[key] = torch.stack(batch_dict[key], dim=0)
 
-        batch_dict['tf_ids'] = torch.stack(tf_ids_batch, dim=0)                      # (B, n_keys, T)
-        batch_dict['tf_attention_mask'] = torch.stack(tf_mask_batch, dim=0)          # (B, n_keys, T)
+        batch_dict['tf_panel_indices'] = torch.stack(
+            [sample['tf_panel_indices'] for sample in batch], dim=0
+        )
+        batch_dict['tf_target_positions'] = torch.stack(
+            [sample['tf_target_positions'] for sample in batch], dim=0
+        )
 
         return batch_dict
 
 
     # Data
-    per_worker_batch_size = args.batch_size * args.gradient_accumulation_steps
     kwargs_workers = args.data_n_workers
 
     train_cfgs = _collect_dataset_configs(experiment_config, "train_dataset")
@@ -460,13 +658,16 @@ def main():
     train_dataloader, train_sampler = build_loader(
         dataset=train_dataset,
         accelerator=accelerator,
-        batch_size=per_worker_batch_size,
+        batch_size=args.batch_size,
         seed=args.seed,
         shuffle=True,
         drop_last=False,
         num_workers=kwargs_workers,
         collate_fn=collate_fn,
-        worker_init_fn=worker_init_fn,   
+        worker_init_fn=worker_init_fn,
+    )
+    train_dataloader = GradientAccumulationLoader(
+        train_dataloader, args.gradient_accumulation_steps
     )
 
     if len(valid_cfgs) > 0:
@@ -479,7 +680,7 @@ def main():
         valid_dataloader, valid_sampler = build_loader(
             dataset=valid_dataset,
             accelerator=accelerator,
-            batch_size=per_worker_batch_size,
+            batch_size=args.batch_size,
             seed=args.seed,
             shuffle=False,
             drop_last=False,
@@ -506,7 +707,7 @@ def main():
         test_dataloader, _ = build_loader(
             dataset=test_dataset,
             accelerator=accelerator,
-            batch_size=per_worker_batch_size,
+            batch_size=args.batch_size,
             seed=args.seed,
             shuffle=False,
             drop_last=False,
@@ -516,8 +717,22 @@ def main():
         )
     else:
         test_dataloader = None
+        test_datasets_list = []
         if accelerator.is_main_process:
             alogger.info("No test data is used.")
+
+    encoding_signature = validate_expression_encoding_consistency(
+        train_datasets_list + (valid_datasets_list if len(valid_cfgs) > 0 else []) + test_datasets_list
+    )
+    expression_panel_bank = build_expression_panel_bank(
+        train_datasets_list + (valid_datasets_list if len(valid_cfgs) > 0 else []) + test_datasets_list
+    )
+    if accelerator.is_main_process:
+        alogger.info(f"expression encoding signature: {encoding_signature}")
+        alogger.info(
+            f"expression panel bank: {tuple(expression_panel_bank.shape)}, "
+            f"{expression_panel_bank.numel() / (1024 ** 2):.2f} MiB uint8"
+        )
 
     if accelerator.is_main_process:
         alogger.info(
@@ -536,6 +751,18 @@ def main():
     if accelerator.is_main_process:
         alogger.info(f'Using model class: {model_cls}')
     model = model_cls(**model_kwargs)
+    model.set_expression_panel_bank(expression_panel_bank)
+    expression_encoder = getattr(model, "expression_encoder", None)
+    checkpoint_encoding_signature = getattr(
+        getattr(expression_encoder, "config", None),
+        "expression_encoding_signature",
+        None,
+    )
+    if checkpoint_encoding_signature is not None and checkpoint_encoding_signature != encoding_signature:
+        raise ValueError(
+            "The expression checkpoint encoding does not match the training/validation/test encoding: "
+            f"checkpoint={checkpoint_encoding_signature}, datasets={encoding_signature}"
+        )
     model_activation_fn = model.activation
 
     # Optimizer 
@@ -546,12 +773,27 @@ def main():
     if accelerator.is_main_process:
         alogger.info(f'Using optimizer class: {optimizer_cls}')
 
-    # frozen DNA encoder layers must not get into the optimizer (weight decay would still move them)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # Frozen predictor parameters must not enter AdamW (weight decay would still move them).
+    trainable_named_params = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
+    if getattr(model, "expression_encoder_only", False):
+        unexpected_trainable = [
+            name for name, _ in trainable_named_params if not name.startswith(("tf.", "tf_adapter."))
+        ]
+        if unexpected_trainable:
+            raise RuntimeError(
+                "Expression-only training exposed frozen predictor parameters: "
+                + ", ".join(unexpected_trainable[:10])
+            )
+    trainable_params = [parameter for _, parameter in trainable_named_params]
     if accelerator.is_main_process:
         n_trainable = sum(p.numel() for p in trainable_params)
         n_total = sum(p.numel() for p in model.parameters())
         alogger.info(f"trainable parameters: {n_trainable:.3e} / {n_total:.3e}")
+        alogger.info(
+            "trainable expression branch: "
+            f"encoder={sum(p.numel() for p in model.tf.parameters() if p.requires_grad):,}, "
+            f"adapter={sum(p.numel() for p in model.tf_adapter.parameters() if p.requires_grad):,}"
+        )
 
     if optimizer_cls in [transformers.optimization.Adafactor, optimizers.Adafactor]:
         optimizer = optimizer_cls(
@@ -575,8 +817,8 @@ def main():
             'gene_id': batch['gene_id'],
             'selected_keys': batch['selected_keys'],
             'dataset_description': batch['dataset_description'],
-            'tf_ids': batch['tf_ids'],
-            'tf_attention_mask': batch['tf_attention_mask'],
+            'tf_panel_indices': batch['tf_panel_indices'],
+            'tf_target_positions': batch['tf_target_positions'],
         }
         return result
     

@@ -5,7 +5,7 @@ from transformers.modeling_outputs import TokenClassifierOutput
 from typing import Optional
 from dataclasses import dataclass
 from transformers import AutoModel, BertConfig, ModernBertModel
-from transformers.utils import cached_file
+from transformers.utils import cached_file, is_flash_attn_2_available
 from transformers.utils import logging as hf_logging
 hf_logging.set_verbosity_warning()
 
@@ -180,6 +180,9 @@ class ExpressionCounts(nn.Module):
             )
 
         updated_state_dict = None
+        attention_backend = (
+            "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+        )
 
         # 1) DNA model (GENA) 
         if hf:
@@ -188,10 +191,12 @@ class ExpressionCounts(nn.Module):
             if "modern" in model_name:
                 if _is_main_process():
                     print(f"Using ModernGENA from {hf_model_name}")
+                if _is_main_process():
+                    print(f"Using {attention_backend} attention")
                 self.bert, info = ModernBertModel.from_pretrained(
                     hf_model_name,
                     trust_remote_code=True,
-                    attn_implementation="flash_attention_2",
+                    attn_implementation=attention_backend,
                     attention_dropout=dropout_prob,
                     embedding_dropout=dropout_prob,
                     mlp_dropout=dropout_prob,
@@ -256,7 +261,7 @@ class ExpressionCounts(nn.Module):
             print(f"Using tf panel encoder from {tf_model_path}")
         self.tf = ModernBertModel.from_pretrained(
             tf_model_path,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attention_backend,
         )
 
         # 3) Condition: LN(tf [CLS]) is added to every DNA token
@@ -275,7 +280,7 @@ class ExpressionCounts(nn.Module):
         self.decoder, info2 = ModernBertModel.from_pretrained(
                 hf_model_name_decoder,
                 trust_remote_code=True,
-                attn_implementation="flash_attention_2",
+                attn_implementation=attention_backend,
                 attention_dropout=dropout_prob,
                 embedding_dropout=dropout_prob,
                 mlp_dropout=dropout_prob,

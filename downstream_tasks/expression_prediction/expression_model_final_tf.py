@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import warnings
 from transformers.modeling_outputs import TokenClassifierOutput
 # from src.gena_lm.modeling_bert import BertPreTrainedModel, BertModel
 from typing import Optional
@@ -7,6 +8,12 @@ from dataclasses import dataclass
 from transformers import AutoModel, BertConfig, ModernBertModel
 from transformers.utils import cached_file
 from transformers.utils import logging as hf_logging
+from downstream_tasks.expression_prediction.expression_profile_encoder import (
+    EXPRESSION_CLS_COUNT,
+    gather_four_cls_states,
+    load_expression_encoder,
+    remove_legacy_expression_weights,
+)
 hf_logging.set_verbosity_warning()
 
 @dataclass
@@ -62,9 +69,8 @@ def cls_deviation_from_mean_loss(
     group_has_mask = (cls_mask.sum(dim=1) > 0).view(B)  # (B,)
     if group_mask is not None:
         group_has_mask = group_has_mask & group_mask.to(cls_mask.device).bool().view(B)
-    if group_has_mask.sum() == 0:
-        return logits.new_zeros(())
-    return loss_per_group[group_has_mask].mean()
+    group_weights = group_has_mask.to(loss_per_group.dtype)
+    return (loss_per_group.view(B) * group_weights).sum() / group_weights.sum().clamp_min(1.0)
 
 
 import torch
@@ -105,19 +111,8 @@ def cls_multinomial_loss(
     group_has_mask = mask_bool.any(dim=1)  # (B,)
     if group_mask is not None:
         group_has_mask = group_has_mask & group_mask.to(cls_mask.device).bool().view(B)
-    if group_has_mask.sum() == 0:
-        return logits.new_zeros(())
-    
-       
     target_max = (cls_labels * cls_mask).max(dim=1).values  # (B,)
     keep = group_has_mask & (target_max > min_target_max)
-    if keep.sum() == 0:
-        return logits.new_zeros(())
-
-    cls_logits = cls_logits[keep]
-    cls_labels = cls_labels[keep]
-    cls_mask   = cls_mask[keep]
-    mask_bool  = mask_bool[keep]
 
     eps = 1e-8
     w = cls_logits.masked_fill(~mask_bool, 0.0)
@@ -133,7 +128,8 @@ def cls_multinomial_loss(
 
     nll_per_group = -(target * log_probs).sum(dim=1)
     
-    return nll_per_group.mean()
+    keep_weights = keep.to(nll_per_group.dtype)
+    return (nll_per_group * keep_weights).sum() / keep_weights.sum().clamp_min(1.0)
 
 class ExpressionCounts(nn.Module):
     """
@@ -141,7 +137,7 @@ class ExpressionCounts(nn.Module):
       - input_ids:      (B*N, L)
       - attention_mask: (B*N, L)
       - token_type_ids: (B*N, L) [optional]
-      - tf_ids:            (B, N, T)  [BOS] bin tokens of the panel genes [CLS]
+      - tf_ids:            (B, N, T)  [BOS] + four gene quarters, each followed by [CLS]
       - tf_attention_mask: (B, N, T)  [optional] 1 - real token, 0 - padding
       - dataset_flag:   (B, N)   [in block of N elements either all 1 (INPUTS duplicates), or all 0 (DESC duplicates)]
       - labels:         (B*N, L, 1)
@@ -162,6 +158,9 @@ class ExpressionCounts(nn.Module):
         hf: bool = False,
         hf_model_name: str = "AIRI-Institute/gena-lm-bert-large-t2t",
         tf_model_path: str = None,
+        tf_config_path: str = None,
+        tf_parameter_dtype: str = "float32",
+        expression_encoder_only: bool = True,
         bert_trainable_layers: Optional[int] = None,
         bert_train_embeddings: bool = False,
         use_deviation_loss: bool = False,
@@ -249,25 +248,43 @@ class ExpressionCounts(nn.Module):
             bert_trainable_layers, bert_train_embeddings, verbose=_is_main_process()
         )
 
-        # 2) tf: panel encoder over the binned expression of the panel genes of the track
-        if tf_model_path is None:
-            raise ValueError("tf_model_path must be provided")
+        # 2) Expression panel encoder. A missing model path intentionally means scratch init;
+        # the old 1,024-wide encoder is not shape-compatible with this 256-wide model.
+        if tf_config_path is None:
+            raise ValueError("tf_config_path must be provided")
+        try:
+            parameter_dtype = getattr(torch, tf_parameter_dtype)
+        except AttributeError as exc:
+            raise ValueError(f"Unknown tf_parameter_dtype {tf_parameter_dtype!r}") from exc
         if _is_main_process():
-            print(f"Using tf panel encoder from {tf_model_path}")
-        self.tf = ModernBertModel.from_pretrained(
-            tf_model_path,
+            source = tf_model_path if tf_model_path is not None else f"scratch ({tf_config_path})"
+            print(f"Using four-CLS expression panel encoder from {source}; parameter dtype={parameter_dtype}")
+        self.tf = load_expression_encoder(
+            config_path=tf_config_path,
+            checkpoint_path=tf_model_path,
             attn_implementation="flash_attention_2",
+            parameter_dtype=parameter_dtype,
         )
 
-        # 3) Condition: LN(tf [CLS]) is added to every DNA token
+        # 3) Condition: concatenate four CLS states, normalize, and add to every DNA token.
         self.gen_hidden_size = config.hidden_size
-        if self.tf.config.hidden_size != self.gen_hidden_size:
+        expression_width = EXPRESSION_CLS_COUNT * self.tf.config.hidden_size
+        if expression_width != self.gen_hidden_size:
             raise ValueError(
-                f"tf hidden_size={self.tf.config.hidden_size} must match "
+                f"4 * expression hidden_size={expression_width} must match "
                 f"DNA encoder hidden_size={self.gen_hidden_size}"
             )
+        self.tf_adapter = nn.Sequential(
+            nn.Linear(self.gen_hidden_size, self.gen_hidden_size),
+            nn.GELU(),
+            nn.Linear(self.gen_hidden_size, self.gen_hidden_size),
+        )
         self.dna_ln = nn.LayerNorm(self.gen_hidden_size)
         self.tf_ln = nn.LayerNorm(self.gen_hidden_size)
+        self.register_buffer(
+            "tf_panel_bank", torch.empty((0, 0), dtype=torch.uint8), persistent=False
+        )
+        self.tf_mask_token_id = int(self.tf.config.mask_token_id)
 
         # 4) Decoder
         if _is_main_process():
@@ -317,6 +334,29 @@ class ExpressionCounts(nn.Module):
         if hasattr(self.decoder, "embeddings") and hasattr(self.decoder.embeddings, "tok_embeddings"):
             self.decoder.embeddings.tok_embeddings.weight.requires_grad_(False)
 
+        self.expression_encoder_only = expression_encoder_only
+        if self.expression_encoder_only:
+            self._configure_expression_encoder_only()
+
+    @property
+    def expression_encoder(self):
+        """Backward-compatible accessor for code introduced with the four-CLS redesign."""
+        return self.tf
+
+    def set_expression_panel_bank(self, panel_bank: torch.Tensor) -> None:
+        """Attach the validated canonical panel bank without serializing data in checkpoints."""
+        if panel_bank.ndim != 2 or panel_bank.shape[0] == 0 or panel_bank.shape[1] == 0:
+            raise ValueError(f"panel_bank must be a non-empty [profiles, tokens] tensor, got {panel_bank.shape}")
+        if panel_bank.min().item() < 0 or panel_bank.max().item() >= self.tf.config.vocab_size:
+            raise ValueError("Expression panel bank contains token IDs outside the encoder vocabulary")
+        self.tf_panel_bank = panel_bank.detach().to(dtype=torch.uint8, device="cpu").contiguous()
+
+    def _configure_expression_encoder_only(self):
+        """Freeze the predictor and leave only the expression encoder and adapter trainable."""
+        self.requires_grad_(False)
+        self.tf.requires_grad_(True)
+        self.tf_adapter.requires_grad_(True)
+
     def _freeze_bert(self, trainable_layers, train_embeddings, verbose=False):
         """Freeze the DNA encoder except its last `trainable_layers` layers.
 
@@ -362,10 +402,58 @@ class ExpressionCounts(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # The trainer calls model.train() every step; frozen DNA layers must stay without dropout.
-        for module in self._frozen_bert_modules:
-            module.eval()
+        if self.expression_encoder_only:
+            # Gradients still flow through these frozen modules to the conditioning
+            # context, but their dropout and other training behavior remain disabled.
+            for module in (self.bert, self.decoder, self.dna_ln, self.tf_ln, self.classifier):
+                module.eval()
+            if mode:
+                self.tf.train()
+                self.tf_adapter.train()
+        else:
+            # The trainer calls model.train() every step; frozen DNA layers must stay without dropout.
+            for module in self._frozen_bert_modules:
+                module.eval()
         return self
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Make legacy expression incompatibility explicit while preserving other weights."""
+        state_dict = dict(state_dict)
+        # all_datasets_2 used the same 1,024-wide conditioning LayerNorm for the
+        # description branch. Preserve those compatible frozen weights.
+        for suffix in ("weight", "bias"):
+            current_key = f"tf_ln.{suffix}"
+            historical_key = f"desc_ln.{suffix}"
+            if current_key not in state_dict and historical_key in state_dict:
+                if state_dict[historical_key].shape == self.state_dict()[current_key].shape:
+                    state_dict[current_key] = state_dict[historical_key]
+        state_dict = remove_legacy_expression_weights(state_dict, self.state_dict())
+        incompatible = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        adapter_missing = [key for key in incompatible.missing_keys if key.startswith("tf_adapter.")]
+        encoder_missing = [key for key in incompatible.missing_keys if key.startswith("tf.")]
+        frozen_missing = [
+            key
+            for key in incompatible.missing_keys
+            if not key.startswith(("tf.", "tf_adapter."))
+        ]
+        if adapter_missing:
+            warnings.warn(
+                f"Initializing the new projection adapter from scratch; checkpoint omitted {len(adapter_missing)} "
+                "tf_adapter tensors.",
+                UserWarning,
+            )
+        if encoder_missing:
+            warnings.warn(
+                f"Initializing the redesigned expression encoder from scratch; checkpoint omitted "
+                f"{len(encoder_missing)} tf tensors.",
+                UserWarning,
+            )
+        if frozen_missing:
+            raise RuntimeError(
+                "Checkpoint is missing weights from frozen predictor components, which cannot be silently "
+                "left randomly initialized in expression-only training: " + ", ".join(frozen_missing[:10])
+            )
+        return incompatible
 
 
     def forward(
@@ -377,6 +465,8 @@ class ExpressionCounts(nn.Module):
         return_dict=None,
         tf_ids=None,                 # (B, N, T)
         tf_attention_mask=None,      # (B, N, T) or None: 1 - real token, 0 - padding
+        tf_panel_indices=None,       # (B, N), rows in the resident expression panel bank
+        tf_target_positions=None,    # (B, N), token positions to replace by [MASK]
         dataset_flag=None,           # (B, N): 1 -> INPUTS duplicates; 0 -> DESC duplicates
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -405,8 +495,16 @@ class ExpressionCounts(nn.Module):
             labels_mask = labels_mask.reshape(B * N, labels_mask.shape[-2], labels_mask.shape[-1])
 
         if tf_ids is None:
-            raise ValueError("tf_ids must be provided")
-        if tf_ids.dim() == 3:                                                                     # (B, N, T) -> (B*N, T)
+            if tf_panel_indices is None or tf_target_positions is None:
+                raise ValueError(
+                    "Provide tf_ids directly or provide both tf_panel_indices and tf_target_positions"
+                )
+            if tf_panel_indices.shape != (B, N) or tf_target_positions.shape != (B, N):
+                raise ValueError(
+                    "Panel indices and target positions must match dataset_flag shape "
+                    f"{(B, N)}, got {tuple(tf_panel_indices.shape)} and {tuple(tf_target_positions.shape)}"
+                )
+        elif tf_ids.dim() == 3:                                           # (B, N, T) -> (B*N, T)
             tf_ids = tf_ids.reshape(B * N, tf_ids.shape[-1])
 
         if tf_attention_mask is not None and tf_attention_mask.dim() == 3:                        # (B, N, T) -> (B*N, T)
@@ -441,38 +539,42 @@ class ExpressionCounts(nn.Module):
             rep_pos = pos_in_compact[rep_inputs_idx]                     
             map_inputs[rows_dup] = rep_pos.repeat_interleave(N)
 
-        if (map_inputs < 0).any():
-            bad = (map_inputs < 0).nonzero(as_tuple=False).squeeze(-1)[:20]
-            raise RuntimeError(
-                f"map_inputs has -1 indices : {bad.tolist()}. "
-                "Check dataset_flag/idx_unique_inputs mapping."
-    )
-
         bert_outputs = self.bert(
                 input_ids=input_ids[idx_unique_inputs],                         
                 attention_mask=attention_mask[idx_unique_inputs],
                 return_dict=True,
             )
         seq_compact = bert_outputs.last_hidden_state                    # (U_inp, L, H)
+        if self.expression_encoder_only:
+            seq_compact = self.dna_ln(seq_compact)
         sequence_output = seq_compact[map_inputs]                       # (B*N, L, H)
-        hidden_size = sequence_output.size(-1)
 
-        # 3) tf: panel of the track -> hidden state of its [CLS] (the last real token)
-        tf_ids = tf_ids.to(device)
-        if tf_attention_mask is None:
-            tf_attention_mask = torch.ones_like(tf_ids)
-        tf_attention_mask = tf_attention_mask.to(device)
+        # 3) Expression panel -> four CLS states in sequence order -> one 1,024-vector.
+        if tf_ids is None:
+            if self.tf_panel_bank.numel() == 0:
+                raise RuntimeError("Expression panel bank has not been attached to the model")
+            flat_indices = tf_panel_indices.reshape(-1).to(device=device, dtype=torch.long)
+            target_positions = tf_target_positions.reshape(-1).to(device=device, dtype=torch.long)
+            tf_ids = self.tf_panel_bank.index_select(0, flat_indices).clone()
+            tf_ids.scatter_(1, target_positions[:, None], self.tf_mask_token_id)
+            tf_ids = tf_ids.long()
+        else:
+            tf_ids = tf_ids.to(device=device, dtype=torch.long)
+        if tf_attention_mask is not None:
+            tf_attention_mask = tf_attention_mask.to(device)
         tf_hidden = self.tf(
             input_ids=tf_ids,
             attention_mask=tf_attention_mask,
             return_dict=True,
-        ).last_hidden_state                                             # (B*N, T, H)
-        cls_pos = tf_attention_mask.long().sum(dim=1) - 1               # (B*N,)
-        tf_output = tf_hidden[torch.arange(tf_hidden.size(0), device=device), cls_pos]   # (B*N, H)
-        tf_output = tf_output.to(sequence_output.dtype)
+        ).last_hidden_state                                             # (B*N, T, 256)
+        tf_output = gather_four_cls_states(
+            tf_hidden, tf_ids, tf_attention_mask, validate=False
+        )                                                               # (B*N, 1024)
+        tf_output = self.tf_adapter(tf_output)                           # (B*N, 1024)
 
-        sequence_output = self.dna_ln(sequence_output)   # (B*N, L, H)
-        tf_output = self.tf_ln(tf_output)                # (B*N, H)
+        if not self.expression_encoder_only:
+            sequence_output = self.dna_ln(sequence_output)
+        tf_output = self.tf_ln(tf_output.to(sequence_output.dtype))      # (B*N, H)
 
         tf_broadcast = tf_output[:, None, :] * attention_mask[:, :, None].to(sequence_output.dtype)
         sequence_output = sequence_output + tf_broadcast
@@ -486,7 +588,8 @@ class ExpressionCounts(nn.Module):
         )
         decoder_output = dec_out.last_hidden_state  # (B*N, L, H)
 
-        logits = self.activation(self.classifier(decoder_output))  # (B*N, L, 1)
+        # final_tf supervises only the DNA CLS token; avoid materializing token-wide logits.
+        logits = self.activation(self.classifier(decoder_output[:, :1, :]))  # (B*N, 1, 1)
 
         # 5) Loss
         loss = None
@@ -498,59 +601,34 @@ class ExpressionCounts(nn.Module):
             labels_reshaped = labels.to(logits.device)
             labels_mask_reshaped = labels_mask.to(logits.device) if labels_mask is not None else None
 
-            unreduced_loss = self.loss_fct(logits, labels_reshaped)  # (B*N, L, 1)
+            cls_labels = labels_reshaped[:, 0:1, :]
+            cls_mask = (
+                labels_mask_reshaped[:, 0:1, :].to(logits.dtype)
+                if labels_mask_reshaped is not None
+                else torch.ones_like(logits)
+            )
+            unreduced_cls_loss = self.loss_fct(logits, cls_labels)
+            cls_loss = (unreduced_cls_loss * cls_mask).sum() / cls_mask.sum().clamp_min(1.0)
+            loss = cls_loss
 
-            if labels_mask_reshaped is not None and labels_mask_reshaped.sum().item() > 0:
-                cls_mask = labels_mask_reshaped[:, 0:1, :]           # (B*N, 1, 1)
-                other_mask = labels_mask_reshaped[:, 1:, :]          # (B*N, L-1, 1)
-
-                if cls_mask.sum().item() > 0:
-                        cls_loss = (unreduced_loss[:, 0:1, :] * cls_mask).sum() / (cls_mask.sum() + 1e-8)
-
-                        
-                        if self.use_deviation_loss:
-                            deviation_loss = cls_deviation_from_mean_loss(
-                                logits,
-                                labels_reshaped,
-                                labels_mask_reshaped,
-                                n_keys=N,
-                                group_mask=block_flag,
-                            )
-                        
-                        if self.use_multinomial_loss:
-                            multinomial_loss = cls_multinomial_loss(
-                                logits,
-                                labels_reshaped,
-                                labels_mask_reshaped,
-                                n_keys=N,
-                                group_mask=block_flag,
-                            )
-
-                if other_mask.sum().item() > 0:
-                    other_loss = (unreduced_loss[:, 1:, :] * other_mask).sum() / (other_mask.sum() + 1e-8)
-
-                if cls_loss is not None and other_loss is not None:
-                    loss = cls_loss + self.weight * other_loss
-                elif cls_loss is not None:
-                    loss = cls_loss
-                elif other_loss is not None:
-                    loss = self.weight * other_loss
-
-                if loss is not None:
-                    if deviation_loss is not None:
-                        loss = loss + self.weight_deviation_loss * deviation_loss
-                    if multinomial_loss is not None:
-                        loss = loss + self.weight_multinomial_loss * multinomial_loss
+            if labels_mask_reshaped is not None and self.use_deviation_loss:
+                deviation_loss = cls_deviation_from_mean_loss(
+                    logits, labels_reshaped, labels_mask_reshaped, n_keys=N, group_mask=block_flag
+                )
+                loss = loss + self.weight_deviation_loss * deviation_loss
+            if labels_mask_reshaped is not None and self.use_multinomial_loss:
+                multinomial_loss = cls_multinomial_loss(
+                    logits, labels_reshaped, labels_mask_reshaped, n_keys=N, group_mask=block_flag
+                )
+                loss = loss + self.weight_multinomial_loss * multinomial_loss
 
         if not return_dict:
             return (loss, logits)
 
-        hidden_states_out = (decoder_output,)
-
         return ExpressionModelOutput(
             loss=loss,
             logits=logits,
-            hidden_states=hidden_states_out,
+            hidden_states=None,
             attentions=bert_outputs.attentions,
             labels_reshaped=labels_reshaped,
             labels_mask_reshaped=labels_mask_reshaped,

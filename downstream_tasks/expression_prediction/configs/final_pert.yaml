@@ -8,7 +8,7 @@ MODEL_PATH_ROOT: ${HOME_PATH}/runs/${TASK_NAME}
 args_params:
 
   _target_: builtins.dict
-  init_checkpoint: "${HOME_PATH}/models/all_datasets_2/pytorch_model.bin"
+  init_checkpoint: "${oc.env:PERT_DATA_ROOT}/models/all_datasets_2/pytorch_model.bin"
   resume:
 
   model_cfg: "./data/configs/L12-H768-A12-V32k-preln.json"
@@ -57,19 +57,19 @@ args_params:
 
   iters: 350000
 
-  gen_tokenizer: "AIRI-Institute/gena-lm-bert-base-t2t"
+  gen_tokenizer: "${oc.env:PERT_DATA_ROOT}/models/modernbert_large"
 
   # tokenizer of the tf panel encoder (lies in the same folder as the tf model)
-  tf_tokenizer: "${HOME_PATH}/models/moderngena-tf-bins50"
+  tf_tokenizer: "${oc.env:PERT_DATA_ROOT}/models/moderngena-tf-bins50"
 
-selected_targets_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/datasets/data/marker_genes.txt"
+selected_targets_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/datasets/data/ct_specific_benchmark/selected_targets.csv"
 
 model_kwargs:
   _target_: builtins.dict
   hf: True
-  hf_model_name: "AIRI-Institute/moderngena-large" # "${HOME_PATH}/models/all_datasets_2"
-  hf_model_name_decoder: "${HOME_PATH}/models/decoder" #dp0.1"
-  tf_model_path: "${HOME_PATH}/models/moderngena-tf-bins50"
+  hf_model_name: "${oc.env:PERT_DATA_ROOT}/models/modernbert_large"
+  hf_model_name_decoder: "${oc.env:PERT_DATA_ROOT}/models/decoder"
+  tf_model_path: "${oc.env:PERT_DATA_ROOT}/models/moderngena-tf-bins50"
   # DNA encoder freezing:
   #   null  - the whole encoder is trainable
   #   0     - every layer frozen
@@ -109,8 +109,8 @@ train_dataset_human:
   _target_: downstream_tasks.expression_prediction.expression_dataset_final_pert.ExpressionDataset
   forward_intervals_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/intervals/human.forward.csv"
   reverse_intervals_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/intervals/human.reverse.csv"
-  targets_path: "${HOME_PATH}/data/pert/train_file_mappings_tpm_borzoi_v1_qref.csv"
-  genome: "${HOME_PATH}/genomes/GRCh38.primary_assembly.genome.fa"
+  targets_path: "${oc.env:PERT_DATA_ROOT}/data/pert/train_file_mappings_tpm_borzoi_v1_qref.csv"
+  genome: "${oc.env:PERT_GENOME}"
   tpm: csv
   num_before: 512
   transform_targets_tpm:
@@ -122,8 +122,8 @@ valid_dataset_human:
   _target_: downstream_tasks.expression_prediction.expression_dataset_final_pert.ExpressionDataset
   forward_intervals_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/intervals/human.forward.csv"
   reverse_intervals_path: "${HOME_PATH}/GENA_LM/downstream_tasks/expression_prediction/intervals/human.reverse.csv"
-  targets_path: "${HOME_PATH}/data/pert/valid_file_mappings_tpm_borzoi_v1_qref.csv"
-  genome: "${HOME_PATH}/genomes/GRCh38.primary_assembly.genome.fa"
+  targets_path: "${oc.env:PERT_DATA_ROOT}/data/pert/valid_file_mappings_tpm_borzoi_v1_qref.csv"
+  genome: "${oc.env:PERT_GENOME}"
   tpm: csv
   num_before: 512
   transform_targets_tpm:

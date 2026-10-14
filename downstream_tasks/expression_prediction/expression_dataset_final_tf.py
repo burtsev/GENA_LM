@@ -21,6 +21,13 @@ import json
 from transformers import AutoTokenizer
 from multiprocessing import Pool
 from downstream_tasks.expression_prediction.datasets.src.utils import convert_fm_relative_path_to_absolute_path
+from downstream_tasks.expression_prediction.expression_profile_encoder import (
+    build_four_cls_panel,
+    encoding_signature,
+    gene_token_positions,
+    load_encoding_bundle,
+    validate_tokenizer_definition,
+)
 from pathlib import Path
 
 
@@ -47,6 +54,9 @@ class ExpressionDataset(Dataset):
         norm_bw = False,
         unk_genes_path: str = None,
         tf_tokenizer: str = None,
+        panel_genes_path: str = None,
+        bin_edges_path: str = None,
+        encoding_metadata_path: str = None,
     ):
 
         self.logger = logging.getLogger(__name__)
@@ -167,6 +177,11 @@ class ExpressionDataset(Dataset):
             raise ValueError("The tf panel is built from the tpm matrix, so tpm must be set")
         if unk_genes_path is None or tf_tokenizer is None:
             raise ValueError("unk_genes_path and tf_tokenizer must be provided")
+        if panel_genes_path is None or bin_edges_path is None or encoding_metadata_path is None:
+            raise ValueError(
+                "panel_genes_path, bin_edges_path, and encoding_metadata_path must be provided; "
+                "historical expression encoding metadata cannot be inferred"
+            )
         self.unk_genes_path = unk_genes_path
         self.unk_genes = set(self.load_unk_genes(unk_genes_path))
 
@@ -177,12 +192,40 @@ class ExpressionDataset(Dataset):
         ]
         self.logger.info(f"excluded {n_before - len(self.valid_indices)} [UNK]-list genes from targets")
 
-        self.tf_genes = self.get_tf_gene_order()
-        self.tf_gene_pos = {gene_id: i + 1 for i, gene_id in enumerate(self.tf_genes)}  # +1 for [BOS]
         self.tf_tokenizer = tf_tokenizer
         self._init_tf_tokens(tf_tokenizer)
-        self.tf_bin_edges = self.load_or_compute_tf_bin_edges()
+        self.tf_genes, self.tf_bin_edges, self.expression_encoding_metadata = load_encoding_bundle(
+            encoding_metadata_path,
+            panel_genes_path,
+            bin_edges_path,
+            self._tf_tokenizer,
+        )
+        self.validate_tf_profile_genes()
+        positions = gene_token_positions(len(self.tf_genes))
+        self.tf_gene_pos = dict(zip(self.tf_genes, positions.tolist()))
+        self.expression_encoding_signature = encoding_signature(self.expression_encoding_metadata)
         self.tf_ids = self.build_tf_ids()
+        self._tf_panel_indices = None
+        self._tf_unknown_panel_index = None
+
+    def expression_panel_entries(self):
+        """Return canonical, unmasked panels for construction of a shared GPU bank."""
+        return [(key, self.tf_ids[key]) for key in self.all_keys]
+
+    def configure_expression_panel_indices(self, key_to_index, unknown_index):
+        """Replace per-sample panel tensors with compact indices into the model bank."""
+        missing = [key for key in self.all_keys if key not in key_to_index]
+        if missing:
+            raise ValueError(f"Expression panel bank is missing keys: {missing[:5]}")
+        self._tf_panel_indices = {key: int(key_to_index[key]) for key in self.all_keys}
+        self._tf_unknown_panel_index = int(unknown_index)
+
+    def _require_expression_panel_bank(self):
+        if self._tf_panel_indices is None or self._tf_unknown_panel_index is None:
+            raise RuntimeError(
+                "Expression panel bank indices are not configured. Build and attach the shared panel bank "
+                "before iterating this dataset."
+            )
 
     def _name_and_size(self, p: str) -> str:
         if p is None:
@@ -661,37 +704,40 @@ class ExpressionDataset(Dataset):
         with open(unk_genes_path, "r", encoding="utf-8") as f:
             return [line.strip() for line in f if line.strip()]
 
-    def get_tf_gene_order(self):
-        """Every gene of the expression matrix, in the column order of the profiles.
+    def validate_tf_profile_genes(self):
+        """Validate that raw profiles can be aligned to the canonical checkpoint panel.
 
-        The position of a gene in the tf sequence is its only identity for the model,
-        so all tracks must share one gene order (and train/valid/test must too).
+        The downloaded perturbation profiles contain three measured-gene subsets and
+        do not all use the same CSV column order. Their raw order is therefore not an
+        encoding contract. We map values by gene id into ``self.tf_genes`` and use the
+        persisted canonical order for every model input. Missing measurements become
+        ``[UNK]``; duplicated or out-of-panel ids remain hard errors.
         """
-        order = self.tpm_lookup[self.all_keys[0]].index
-        if not order.is_unique:
-            raise ValueError(f"Duplicated gene ids in the tpm profile of {self.all_keys[0]}")
-        for key in self.all_keys[1:]:
-            if not self.tpm_lookup[key].index.equals(order):
+        canonical = set(self.tf_genes)
+        schemas = set()
+        for key in self.all_keys:
+            order = self.tpm_lookup[key].index
+            if not order.is_unique:
+                raise ValueError(f"Duplicated gene ids in the tpm profile of {key}")
+            outside = [gene_id for gene_id in order if gene_id not in canonical]
+            if outside:
                 raise ValueError(
-                    f"Gene columns of {key} differ from {self.all_keys[0]}: the tf panel needs one gene order"
+                    f"Expression profile {key} has {len(outside)} genes outside the canonical panel; "
+                    f"first unexpected gene: {outside[0]!r}"
                 )
-        self.logger.info(f"tf panel: {len(order)} genes, first {order[0]}, last {order[-1]}")
-        return list(order)
+            schemas.add(tuple(order))
+        self.logger.info(
+            f"tf panel: {len(self.tf_genes)} canonical genes; aligned {len(self.all_keys)} profiles "
+            f"from {len(schemas)} raw gene schemas by gene id"
+        )
 
     def _init_tf_tokens(self, tf_tokenizer):
         tokenizer = AutoTokenizer.from_pretrained(tf_tokenizer)
-        vocab = tokenizer.get_vocab()
-        bin_ids = []
-        while f"[BIN_{len(bin_ids)}]" in vocab:
-            bin_ids.append(vocab[f"[BIN_{len(bin_ids)}]"])
-        if len(bin_ids) < 2:
-            raise ValueError(f"No [BIN_i] tokens found in the tf tokenizer at {tf_tokenizer}")
-        for name in ("bos", "cls", "unk", "pad", "mask"):
-            if getattr(tokenizer, f"{name}_token_id") is None:
-                raise ValueError(f"tf tokenizer at {tf_tokenizer} has no {name} token")
+        definition = validate_tokenizer_definition(tokenizer)
+        self._tf_tokenizer = tokenizer
 
-        self.tf_bin_ids = np.asarray(bin_ids, dtype=np.int16)
-        self.tf_n_bins = len(bin_ids)
+        self.tf_bin_ids = np.asarray(definition["bin_token_ids"], dtype=np.int16)
+        self.tf_n_bins = len(self.tf_bin_ids)
         self.tf_bos_id = tokenizer.bos_token_id
         self.tf_cls_id = tokenizer.cls_token_id
         self.tf_unk_id = tokenizer.unk_token_id
@@ -706,48 +752,8 @@ class ExpressionDataset(Dataset):
         with np.errstate(invalid="ignore", divide="ignore"):
             return np.asarray(self.transform_targets_tpm(values), dtype=np.float32)
 
-    def get_tf_edges_path(self):
-        transform = self.transform_targets_tpm
-        transform_tag = "none" if transform is None else f"{type(transform).__name__}{sorted(vars(transform).items())}"
-        tag = hashlib.blake2b(f"{self.tf_n_bins}|{transform_tag}".encode("utf-8"), digest_size=8).hexdigest()
-        return f"{self.get_tpm_hash_path()}.tfedges.{tag}.npy"
-
-    def load_or_compute_tf_bin_edges(self):
-        """Quantile bin edges over the whole expression matrix of the dataset.
-
-        The pool is every finite value of every gene of every track, taken after
-        transform_targets_tpm, so each bin holds an equal share of the matrix.
-        The edges depend only on targets_path: datasets with different tables get different edges.
-        """
-        path = self.get_tf_edges_path()
-        n_edges = self.tf_n_bins - 1
-        if os.path.exists(path):
-            edges = np.load(path)
-            if edges.shape != (n_edges,):
-                raise ValueError(f"{path} holds {edges.shape} edges, expected {n_edges}")
-            return edges
-
-        values = np.concatenate([self.tpm_lookup[key].to_numpy(dtype=np.float32).ravel() for key in self.all_keys])
-        values = self._transform_tpm(values)
-        values = values[np.isfinite(values)]
-        if values.size == 0:
-            raise ValueError(f"No finite expression values to compute tf bin edges for {self.targets_path}")
-
-        edges = np.quantile(values, np.arange(1, self.tf_n_bins) / self.tf_n_bins)
-        n_duplicated = n_edges - np.unique(edges).size
-        if n_duplicated > 0:
-            self.logger.warning(
-                f"{n_duplicated} of {n_edges} tf bin edges coincide (many equal values); some bins will stay empty"
-            )
-        self.logger.info(f"tf bin edges from {values.size} values: min {edges[0]:.4g}, max {edges[-1]:.4g}")
-
-        temp_path = f"{path}.{os.getpid()}.temp.npy"
-        np.save(temp_path, edges)
-        os.replace(temp_path, path)
-        return edges
-
     def build_tf_ids(self):
-        """Per track: [BOS] + one token per gene (in tf_genes order) + [CLS].
+        """Build four contiguous gene quarters, each followed by the shared CLS token.
 
         A gene gets [UNK] when it is in the [UNK] list, or its value is empty/NaN/inf
         (also after the transform), otherwise the token of its bin. The target gene is
@@ -758,15 +764,18 @@ class ExpressionDataset(Dataset):
         tf_ids = {}
         known_share = []
         for key in self.all_keys:
-            values = self._transform_tpm(self.tpm_lookup[key].iloc[:, 0].to_numpy(dtype=np.float32))
+            # Reindex first: token position is defined only by the checkpoint's
+            # canonical gene list, never by an individual CSV's column order.
+            values = self.tpm_lookup[key].iloc[:, 0].reindex(self.tf_genes).to_numpy(dtype=np.float32)
+            values = self._transform_tpm(values)
             known = np.isfinite(values) & ~forced_unk
             bins = np.searchsorted(self.tf_bin_edges, values[known], side="right")
 
-            ids = np.full(n_genes + 2, self.tf_unk_id, dtype=np.int16)
-            ids[0] = self.tf_bos_id
-            ids[-1] = self.tf_cls_id
-            ids[1:-1][known] = self.tf_bin_ids[bins]
-            tf_ids[key] = torch.from_numpy(ids)
+            gene_ids = np.full(n_genes, self.tf_unk_id, dtype=np.int16)
+            gene_ids[known] = self.tf_bin_ids[bins]
+            tf_ids[key] = torch.from_numpy(
+                build_four_cls_panel(gene_ids, self.tf_bos_id, self.tf_cls_id)
+            )
             known_share.append(known.mean())
 
         self.logger.info(
@@ -774,9 +783,10 @@ class ExpressionDataset(Dataset):
             f"known per track: mean {np.mean(known_share):.3f}, min {np.min(known_share):.3f}"
         )
         # rows that pad an incomplete chunk of tracks: their labels are masked out
-        self.tf_unknown_panel = torch.full((n_genes + 2,), self.tf_unk_id, dtype=torch.int16)
-        self.tf_unknown_panel[0] = self.tf_bos_id
-        self.tf_unknown_panel[-1] = self.tf_cls_id
+        unknown_gene_ids = np.full(n_genes, self.tf_unk_id, dtype=np.int16)
+        self.tf_unknown_panel = torch.from_numpy(
+            build_four_cls_panel(unknown_gene_ids, self.tf_bos_id, self.tf_cls_id)
+        )
         return tf_ids
 
     def __len__(self):
@@ -864,14 +874,15 @@ class ExpressionDataset(Dataset):
             start_coord = starts[L-1]
             end_coord   = ends[0]
 
-        tf_ids = [self.tf_ids[key] for key in selected_keys]
-        tf_ids += [self.tf_unknown_panel] * (self.n_keys - len(tf_ids))
-        tf_ids = torch.stack(tf_ids, dim=0).long()              # (n_keys, T)
-        # the predicted gene must not see its own value in the panel
+        self._require_expression_panel_bank()
+        tf_panel_indices = [self._tf_panel_indices[key] for key in selected_keys]
+        tf_panel_indices += [self._tf_unknown_panel_index] * (self.n_keys - len(tf_panel_indices))
+        tf_panel_indices = torch.as_tensor(tf_panel_indices, dtype=torch.int32)
+        # The model gathers the panel bank on GPU and masks this position there.
         target_pos = self.tf_gene_pos.get(gene_id)
-        if target_pos is not None:
-            tf_ids[:, target_pos] = self.tf_mask_id
-        tf_attention_mask = torch.ones_like(tf_ids)             # (n_keys, T)
+        if target_pos is None:
+            raise ValueError(f"Target gene {gene_id!r} is absent from the canonical expression panel")
+        tf_target_positions = torch.full((self.n_keys,), target_pos, dtype=torch.int32)
 
         if self.bw and not self.tpm: 
             features_selected_keys = []
@@ -893,8 +904,8 @@ class ExpressionDataset(Dataset):
             "end": end_coord,
             "dataset_description": [self.dataset_description] * self.n_keys,
             "dataset_flag": torch.ones(self.n_keys, dtype=torch.float32),
-            "tf_ids": tf_ids,
-            "tf_attention_mask": tf_attention_mask,
+            "tf_panel_indices": tf_panel_indices,
+            "tf_target_positions": tf_target_positions,
         }
 
         return features
@@ -1179,13 +1190,19 @@ class ExpressionDatasetMode2(ExpressionDataset):
         batch_labels[:, 0, 0] = torch.where(tpm_ok, tpm_t, torch.zeros_like(tpm_t))
         batch_mask[:, 0, 0]   = tpm_ok
 
-        tf_ids = self.tf_ids[cell_id].long().unsqueeze(0).repeat(self.n_keys, 1)   # (n_keys, T)
-        # every row predicts its own gene, which must not see its value in the panel
+        self._require_expression_panel_bank()
+        tf_panel_indices = torch.full(
+            (self.n_keys,), self._tf_panel_indices[cell_id], dtype=torch.int32
+        )
+        # Every row predicts its own gene; masking is applied after the GPU bank gather.
+        # Padded rows are ignored by labels/attention; position 1 is nevertheless a
+        # valid gene token, so their synthetic mask never overwrites BOS/CLS.
+        tf_target_positions = torch.ones(self.n_keys, dtype=torch.int32)
         for row, gene_id in enumerate(gene_ids):
             target_pos = self.tf_gene_pos.get(gene_id)
-            if target_pos is not None:
-                tf_ids[row, target_pos] = self.tf_mask_id
-        tf_attention_mask = torch.ones_like(tf_ids)                                # (n_keys, T)
+            if target_pos is None:
+                raise ValueError(f"Target gene {gene_id!r} is absent from the canonical expression panel")
+            tf_target_positions[row] = target_pos
 
         if self.bw and not self.tpm: 
             features_gene_id = []
@@ -1207,8 +1224,8 @@ class ExpressionDatasetMode2(ExpressionDataset):
             "end": ends_meta,
             "dataset_description": [self.dataset_description] * self.n_keys,
             "dataset_flag": torch.zeros(self.n_keys, dtype=torch.float32),
-            "tf_ids": tf_ids,
-            "tf_attention_mask": tf_attention_mask,
+            "tf_panel_indices": tf_panel_indices,
+            "tf_target_positions": tf_target_positions,
         }
         return features
 

@@ -1,0 +1,43 @@
+{
+  "architectures": [
+    "ExpressionModernBertModel"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.1,
+  "bos_token_id": 4,
+  "deterministic_flash_attn": false,
+  "embedding_dropout": 0.1,
+  "eos_token_id": 6,
+  "expression_attention_schedule": [
+    "local",
+    "global"
+  ],
+  "expression_cls_count": 4,
+  "expression_cls_strategy": "bos_then_four_contiguous_gene_quarters_each_followed_by_cls",
+  "expression_cls_token_id": 0,
+  "global_attn_every_n_layers": 2,
+  "global_rope_theta": 10000.0,
+  "hidden_activation": "relu",
+  "hidden_size": 256,
+  "initializer_cutoff_factor": 2.0,
+  "initializer_range": 0.02,
+  "intermediate_size": 256,
+  "local_attention": 16,
+  "local_rope_theta": 10000.0,
+  "mask_token_id": 3,
+  "max_position_embeddings": 24835,
+  "mlp_bias": false,
+  "mlp_dropout": 0.1,
+  "model_type": "modernbert",
+  "norm_bias": false,
+  "norm_eps": 0.00001,
+  "num_attention_heads": 4,
+  "num_hidden_layers": 2,
+  "pad_token_id": 2,
+  "parameter_dtype": "float32",
+  "sep_token_id": 5,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.55.2",
+  "unk_token_id": 1,
+  "vocab_size": 57
+}
